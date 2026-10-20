@@ -492,6 +492,11 @@ func hostAuthGetByIndex(authIndex string) ([]byte, error) {
 type storedAuth struct {
 	Auth    storedTokens  `json:"auth"`
 	Account storedAccount `json:"account"`
+
+	// rawJSON keeps the complete source credential document. CPA-owned routing
+	// fields (prefix/weight/priority/proxy_url/headers/...) are deliberately not
+	// modeled by storedAuth, but must survive parse -> edit -> persist round trips.
+	rawJSON []byte
 }
 
 // storedTokens holds one credential family at a time in Access/RefreshToken,
@@ -551,6 +556,7 @@ func parseStored(raw []byte) (*storedAuth, error) {
 			PersonalToken string `json:"personalToken"` // PAT fallback — must survive the flat shape too
 			ExpiresAt     int64  `json:"expiresAt"`
 			Domain        string `json:"domain"`
+			Region        string `json:"region"`
 			UID           string `json:"uid"`
 			EnterpriseID  string `json:"enterpriseId"`
 			Nickname      string `json:"nickname"`
@@ -558,12 +564,15 @@ func parseStored(raw []byte) (*storedAuth, error) {
 		if err := json.Unmarshal(raw, &flat); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
 		}
-		sa.Auth = storedTokens{AccessToken: flat.AccessToken, RefreshToken: flat.RefreshToken, PersonalToken: flat.PersonalToken, ExpiresAt: flat.ExpiresAt, Domain: flat.Domain}
+		sa.Auth = storedTokens{AccessToken: flat.AccessToken, RefreshToken: flat.RefreshToken, PersonalToken: flat.PersonalToken, ExpiresAt: flat.ExpiresAt, Domain: flat.Domain, Region: flat.Region}
 		sa.Account = storedAccount{UID: flat.UID, EnterpriseID: flat.EnterpriseID, Nickname: flat.Nickname}
 	}
 	if sa.Auth.AccessToken == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	// Retain the full original document so AuthData.StorageJSON and every later
+	// save can preserve host/UI fields that the provider structs do not model.
+	sa.rawJSON = append([]byte(nil), raw...)
 	return &sa, nil
 }
 
@@ -697,7 +706,8 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	// so emitting the cr==nil placeholder here would replace a known "余N 已用N"
 	// note with "积分未知" in the management API even though the file on disk
 	// still carries live numbers.
-	ad := toAuthDataOptsWithNote(sa, nil, false, noteCreditsFromJSON(req.RawJSON))
+	disabled := parseDisabledFromAuthJSON(req.RawJSON)
+	ad := toAuthDataWithMetadata(sa, authMetadataFromJSON(req.RawJSON), disabled, noteCreditsFromJSON(req.RawJSON))
 	ad.ID = "" // let host compute from path (prevents ID mismatch dupes)
 	if fn := strings.TrimSpace(req.FileName); fn != "" {
 		ad.FileName = fn
@@ -712,6 +722,18 @@ func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	return toAuthDataOpts(sa, nil, false)
 }
 
+func toAuthDataWithMetadata(sa *storedAuth, existing map[string]any, disabled bool, prevCredits string) pluginapi.AuthData {
+	ad := toAuthDataOptsWithNote(sa, nil, disabled, prevCredits)
+	ad.Metadata = mergeAuthMetadata(sa, existing, disabled, prevCredits)
+	if prefix, ok := ad.Metadata["prefix"].(string); ok {
+		ad.Prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	}
+	if proxyURL, ok := ad.Metadata["proxy_url"].(string); ok {
+		ad.ProxyURL = strings.TrimSpace(proxyURL)
+	}
+	return ad
+}
+
 // toAuthDataOpts builds AuthData with optional credits snapshot and disabled flag.
 func toAuthDataOpts(sa *storedAuth, cr *creditsSummary, disabled bool) pluginapi.AuthData {
 	return toAuthDataOptsWithNote(sa, cr, disabled, "")
@@ -721,7 +743,7 @@ func toAuthDataOpts(sa *storedAuth, cr *creditsSummary, disabled bool) pluginapi
 // segment, used by paths that must not regress a live note to "积分未知"
 // (notably AuthParse, which the host calls on every reload).
 func toAuthDataOptsWithNote(sa *storedAuth, cr *creditsSummary, disabled bool, prevCredits string) pluginapi.AuthData {
-	storage, _ := json.Marshal(sa)
+	storage := storageJSONForAuth(sa)
 	id := providerName
 	fileName := authFileName
 	if sa != nil {

@@ -203,29 +203,219 @@ func hostAuthSaveJSON(name string, raw []byte) error {
 	return nil
 }
 
+// mergeAuthStorageJSON overlays provider-owned auth/account values onto the
+// complete credential document while preserving CPA/UI metadata and fields
+// unknown to the current plugin version.
+func mergeAuthStorageJSON(raw []byte, sa *storedAuth) ([]byte, error) {
+	if sa == nil {
+		return nil, fmt.Errorf("nil storedAuth")
+	}
+	doc := map[string]json.RawMessage{}
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, err
+		}
+		if doc == nil {
+			doc = map[string]json.RawMessage{}
+		}
+	}
+	var source map[string]json.RawMessage
+	if len(strings.TrimSpace(string(sa.rawJSON))) > 0 && json.Unmarshal(sa.rawJSON, &source) == nil && source != nil {
+		if len(doc) == 0 {
+			doc = source
+		} else {
+			_, currentNested := doc["auth"]
+			for key, value := range source {
+				if key == "auth" || key == "account" || (currentNested && isFlatAuthField(key)) {
+					continue
+				}
+				if _, exists := doc[key]; !exists {
+					doc[key] = value
+				}
+			}
+		}
+	}
+	if _, currentNested := doc["auth"]; !currentNested {
+		if sourceAuth, sourceNested := source["auth"]; sourceNested {
+			doc["auth"] = sourceAuth
+			if sourceAccount, ok := source["account"]; ok {
+				doc["account"] = sourceAccount
+			}
+			for key := range doc {
+				if isFlatAuthField(key) {
+					delete(doc, key)
+				}
+			}
+		}
+	}
+	storage, err := json.Marshal(sa)
+	if err != nil {
+		return nil, err
+	}
+	var nested map[string]json.RawMessage
+	if err := json.Unmarshal(storage, &nested); err != nil {
+		return nil, err
+	}
+	if _, nestedShape := doc["auth"]; nestedShape {
+		if source != nil {
+			if sourceAuth, ok := source["auth"]; ok {
+				doc["auth"], err = mergeJSONObjects(sourceAuth, doc["auth"])
+				if err != nil { return nil, err }
+			}
+			if sourceAccount, ok := source["account"]; ok {
+				doc["account"], err = mergeJSONObjects(sourceAccount, doc["account"])
+				if err != nil { return nil, err }
+			}
+		}
+		doc["auth"], err = mergeJSONObjects(doc["auth"], nested["auth"])
+		if err != nil { return nil, err }
+		doc["account"], err = mergeJSONObjects(doc["account"], nested["account"])
+		if err != nil { return nil, err }
+	} else {
+		set := func(key string, value any) error {
+			encoded, err := json.Marshal(value)
+			if err != nil { return err }
+			doc[key] = encoded
+			return nil
+		}
+		for key, value := range map[string]any{
+			"accessToken": sa.Auth.AccessToken, "refreshToken": sa.Auth.RefreshToken,
+			"personalToken": sa.Auth.PersonalToken, "expiresAt": sa.Auth.ExpiresAt,
+			"domain": sa.Auth.Domain, "region": sa.Auth.Region,
+			"uid": sa.Account.UID, "enterpriseId": sa.Account.EnterpriseID,
+			"nickname": sa.Account.Nickname,
+		} {
+			if err := set(key, value); err != nil { return nil, err }
+		}
+	}
+	doc["type"] = json.RawMessage(`"qoder"`)
+	doc["provider"] = json.RawMessage(`"qoder"`)
+	doc["auth_kind"] = json.RawMessage(`"oauth"`)
+	return json.Marshal(doc)
+}
+
+func isFlatAuthField(key string) bool {
+	switch key {
+	case "accessToken", "refreshToken", "personalToken", "expiresAt", "domain", "region", "uid", "enterpriseId", "nickname":
+		return true
+	default:
+		return false
+	}
+}
+
+func mergeJSONObjects(existing, replacement json.RawMessage) (json.RawMessage, error) {
+	var out map[string]json.RawMessage
+	if len(existing) > 0 && string(existing) != "null" {
+		if err := json.Unmarshal(existing, &out); err != nil { out = nil }
+	}
+	if out == nil { out = make(map[string]json.RawMessage) }
+	var next map[string]json.RawMessage
+	if err := json.Unmarshal(replacement, &next); err != nil { return nil, err }
+	for key, value := range next { out[key] = value }
+	return json.Marshal(out)
+}
+
+func storageJSONForAuth(sa *storedAuth) []byte {
+	if sa == nil { return nil }
+	if len(sa.rawJSON) > 0 {
+		if merged, err := mergeAuthStorageJSON(sa.rawJSON, sa); err == nil { return merged }
+		return append([]byte(nil), sa.rawJSON...)
+	}
+	raw, _ := json.Marshal(sa)
+	return raw
+}
+
+// authMetadataFromJSON extracts host-managed top-level metadata without
+// copying provider-owned credential fields into AuthData.Metadata.
+func authMetadataFromJSON(raw []byte) map[string]any {
+	var doc map[string]any
+	if len(strings.TrimSpace(string(raw))) == 0 || json.Unmarshal(raw, &doc) != nil { return nil }
+	out := make(map[string]any)
+	for key, value := range doc {
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "auth", "account", "accesstoken", "refreshtoken", "personaltoken", "expiresat", "domain", "region", "uid", "enterpriseid", "nickname":
+			continue
+		default:
+			out[key] = value
+		}
+	}
+	if len(out) == 0 { return nil }
+	return out
+}
+
+func metadataBool(value any) bool {
+	switch v := value.(type) {
+	case bool: return v
+	case string: return strings.EqualFold(strings.TrimSpace(v), "true") || strings.TrimSpace(v) == "1"
+	case float64: return v != 0
+	default: return false
+	}
+}
+
+func mergeAuthMetadata(sa *storedAuth, existing map[string]any, disabled bool, prevCredits string) map[string]any {
+	defaults := enrichAuthMetadataWithPrev(sa, nil, disabled, prevCredits)
+	out := make(map[string]any, len(existing)+len(defaults))
+	for key, value := range existing { out[key] = value }
+	for key, value := range defaults { if _, ok := out[key]; !ok { out[key] = value } }
+	out["type"] = providerName
+	out["provider"] = providerName
+	out["auth_kind"] = "oauth"
+	out["disabled"] = disabled
+	return out
+}
+
+func authForPhysicalSave(phys *hostAuthPhysical, fallback *storedAuth) *storedAuth {
+	if phys != nil && len(phys.JSON) > 0 {
+		if current, err := parseStored(phys.JSON); err == nil { return current }
+	}
+	return fallback
+}
+
+func buildAuthFileJSONPreserving(phys *hostAuthPhysical, sa *storedAuth, disabled bool, note string, extra map[string]any) ([]byte, error) {
+	if phys == nil || len(phys.JSON) == 0 { return buildAuthFileJSON(sa, disabled, note, extra) }
+	sa = authForPhysicalSave(phys, sa)
+	raw, err := mergeAuthStorageJSON(phys.JSON, sa)
+	if err != nil { return nil, err }
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil { return nil, err }
+	doc["type"] = providerName
+	doc["provider"] = providerName
+	doc["auth_kind"] = "oauth"
+	doc["logo"] = pluginLogoURL
+	doc["disabled"] = disabled
+	doc["note"] = note
+	for key, value := range extra { doc[key] = value }
+	return json.Marshal(doc)
+}
+
 // lifecycleStateUnchanged avoids redundant saves when note/disabled unchanged.
 
 func buildAuthFileJSON(sa *storedAuth, disabled bool, note string, extra map[string]any) ([]byte, error) {
 	if sa == nil {
 		return nil, fmt.Errorf("nil storedAuth")
 	}
-	storage, err := json.Marshal(sa)
-	if err != nil {
-		return nil, err
+	var out map[string]any
+	if len(sa.rawJSON) > 0 {
+		raw, err := mergeAuthStorageJSON(sa.rawJSON, sa)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, err
+		}
+	} else {
+		storage, err := json.Marshal(sa)
+		if err != nil { return nil, err }
+		var nested map[string]any
+		if err := json.Unmarshal(storage, &nested); err != nil { return nil, err }
+		out = map[string]any{"auth": nested["auth"], "account": nested["account"]}
 	}
-	var nested map[string]any
-	if err := json.Unmarshal(storage, &nested); err != nil {
-		return nil, err
-	}
-	out := map[string]any{
-		"type":     providerName,
-		"provider": providerName,
-		"logo":     pluginLogoURL,
-		"disabled": disabled,
-		"note":     note,
-		"auth":     nested["auth"],
-		"account":  nested["account"],
-	}
+	out["type"] = providerName
+	out["provider"] = providerName
+	out["auth_kind"] = "oauth"
+	out["logo"] = pluginLogoURL
+	out["disabled"] = disabled
+	out["note"] = note
 	for k, v := range extra {
 		out[k] = v
 	}
