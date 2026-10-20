@@ -365,18 +365,24 @@ func mergeAuthMetadata(sa *storedAuth, existing map[string]any, disabled bool, p
 }
 
 func authForPhysicalSave(phys *hostAuthPhysical, fallback *storedAuth) *storedAuth {
-	if fallback != nil {
-		if len(fallback.rawJSON) == 0 && phys != nil && len(phys.JSON) > 0 {
-			fallback.rawJSON = append([]byte(nil), phys.JSON...)
-		}
-		return fallback
-	}
 	if phys != nil && len(phys.JSON) > 0 {
 		if current, err := parseStored(phys.JSON); err == nil {
+			if fallback != nil && len(fallback.rawJSON) > 0 {
+				// Callers may intentionally override identity/routing fields
+				// (adoption rewrites region/domain) that the physical file still
+				// carries. Copy only those intent fields onto the fresh snapshot
+				// so lifecycle writes never resurrect a stale token.
+				if r := strings.TrimSpace(fallback.Auth.Region); r != "" {
+					current.Auth.Region = r
+				}
+				if d := strings.TrimSpace(fallback.Auth.Domain); d != "" {
+					current.Auth.Domain = d
+				}
+			}
 			return current
 		}
 	}
-	return nil
+	return fallback
 }
 
 func buildAuthFileJSONPreserving(phys *hostAuthPhysical, sa *storedAuth, disabled bool, note string, extra map[string]any) ([]byte, error) {
