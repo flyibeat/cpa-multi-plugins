@@ -640,7 +640,8 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		sa.Auth.RefreshToken = tok.RefreshToken
 		sa.Auth.ExpiresAt = preserveExpiry(deviceExpiryUnix(tok), sa.Auth.ExpiresAt)
 		invalidateCosySession(sa.Account.UID)
-		return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+		existingMetadata, disabled := authRefreshMetadata(req)
+		return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa, existingMetadata, disabled, req.StorageJSON)})
 	}
 
 	// Legacy PAT family: Tier 1 jrt- refresh → Tier 2 PAT re-exchange.
@@ -664,7 +665,8 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	// Host persists the refreshed credential itself after Refresh returns
 	// (conductor.go refreshAuth → m.Update → persist). Writing from the
 	// plugin too would double-write the file.
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+	existingMetadata, disabled := authRefreshMetadata(req)
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa, existingMetadata, disabled, req.StorageJSON)})
 }
 
 // preserveExpiry reuses the previous token's expiresAt when the refresh
@@ -681,11 +683,33 @@ func preserveExpiry(newExpiry, oldExpiry int64) int64 {
 	return tokenExpiryUnix(oldExpiry)
 }
 
-// toAuthDataForRefresh mirrors the workbuddy helper: blank out FileName and
-// ID so the host backfills from the original auth path (prevents ID mismatch
-// duplicate files when Refresh round-trips the record).
-func toAuthDataForRefresh(sa *storedAuth) pluginapi.AuthData {
-	ad := toAuthDataOpts(sa, nil, false)
+// authRefreshMetadata combines persisted metadata with the host's current
+// authoritative view. This keeps UI-managed routing fields and disabled state
+// intact when the host persists the refreshed AuthData.
+func authRefreshMetadata(req pluginapi.AuthRefreshRequest) (map[string]any, bool) {
+	existing := authMetadataFromJSON(req.StorageJSON)
+	if existing == nil {
+		existing = make(map[string]any)
+	}
+	for key, value := range req.Metadata {
+		existing[key] = value
+	}
+	disabled := parseDisabledFromAuthJSON(req.StorageJSON)
+	if value, ok := existing["disabled"]; ok {
+		disabled = metadataBool(value)
+	}
+	return existing, disabled
+}
+
+// toAuthDataForRefresh leaves FileName/ID empty so CPA keeps the original
+// record identity, while returning a full merged storage document.
+func toAuthDataForRefresh(sa *storedAuth, existing map[string]any, disabled bool, previousStorage ...[]byte) pluginapi.AuthData {
+	ad := toAuthDataWithMetadata(sa, existing, disabled, noteCreditsFromJSON(storageJSONForAuth(sa)))
+	if len(previousStorage) > 0 {
+		if merged, err := mergeAuthStorageJSON(previousStorage[0], sa); err == nil {
+			ad.StorageJSON = merged
+		}
+	}
 	ad.FileName = "" // let host backfill original
 	ad.ID = ""       // let host compute from path (prevents ID mismatch dupes)
 	return ad
