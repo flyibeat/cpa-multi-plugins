@@ -365,19 +365,36 @@ func mergeAuthMetadata(sa *storedAuth, existing map[string]any, disabled bool, p
 }
 
 func authForPhysicalSave(phys *hostAuthPhysical, fallback *storedAuth) *storedAuth {
-	if phys != nil && len(phys.JSON) > 0 {
-		if current, err := parseStored(phys.JSON); err == nil { return current }
+	if fallback != nil {
+		if len(fallback.rawJSON) == 0 && phys != nil && len(phys.JSON) > 0 {
+			fallback.rawJSON = append([]byte(nil), phys.JSON...)
+		}
+		return fallback
 	}
-	return fallback
+	if phys != nil && len(phys.JSON) > 0 {
+		if current, err := parseStored(phys.JSON); err == nil {
+			return current
+		}
+	}
+	return nil
 }
 
 func buildAuthFileJSONPreserving(phys *hostAuthPhysical, sa *storedAuth, disabled bool, note string, extra map[string]any) ([]byte, error) {
-	if phys == nil || len(phys.JSON) == 0 { return buildAuthFileJSON(sa, disabled, note, extra) }
+	if phys == nil || len(phys.JSON) == 0 {
+		return buildAuthFileJSON(sa, disabled, note, extra)
+	}
 	sa = authForPhysicalSave(phys, sa)
+	if sa == nil {
+		return nil, fmt.Errorf("nil storedAuth")
+	}
 	raw, err := mergeAuthStorageJSON(phys.JSON, sa)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil { return nil, err }
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
 	doc["type"] = providerName
 	doc["provider"] = providerName
 	doc["auth_kind"] = "oauth"
