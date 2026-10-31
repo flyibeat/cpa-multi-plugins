@@ -138,15 +138,18 @@ func parseQueueSignal(body string) queueSignal {
 		if sig.retryAfter > queueWaitCap {
 			sig.retryAfter = queueWaitCap
 		}
-		// Head of the queue: the ticket itself says nobody is ahead, yet it
-		// still carries the same 30s estimate. Sleeping that three times buys
-		// nothing when the next call is usually admitted, so those tickets run
-		// the fast ladder instead. A ticket with a real depth keeps its
-		// interval and the general attempt/budget bounds.
-		if sig.depthSeen && sig.queueCount <= 0 {
-			sig.emptyQueue = true
-			sig.retryAfter = queueFastRetryBackoff
-		}
+		// HEAD-OF-QUEUE FAST LADDER DISABLED (local build, 2026-10-31):
+		// upstream 0.8.71/0.8.72 re-routed empty-queue tickets (queueCount==0)
+		// onto a 700ms x 4 fast ladder plus a 10s model cooldown. On this
+		// deployment the upstream keeps issuing empty-queue tickets for
+		// minutes at a time, so the ladder just fails 4x in ~3s and benches
+		// the pair. The v0.8.64..0.8.69 behaviour is preferred here: honour
+		// the ticket's own interval (clamped to queueWaitDefault..queueWaitCap)
+		// and let the attempt/budget bounds decide. No emptyQueue marking and
+		// no interval rewrite — the executors' existing sleep path
+		// (queueWaitFor(sig.retryAfter)) then waits patiently like 0.8.69.
+		_ = sig.depthSeen
+		_ = sig.queueCount
 	}
 	return sig
 }
